@@ -39,12 +39,21 @@ class OTAManager:
         image: OtaImageWithMetadata,
         progress_callback=None,
         force: bool = False,
+        multi_device_images: dict[int, OtaImageWithMetadata] | None = None,
     ) -> None:
         self.device = device
         self.ota_cluster = find_ota_cluster(device)
 
-        self.image = image
-        self._image_data = image.firmware.serialize()
+        # Support for multiple device types
+        if multi_device_images is not None:
+            self.multi_device_images = multi_device_images
+            # Use the first image as the primary one for backward compatibility
+            self.image = next(iter(multi_device_images.values()))
+        else:
+            self.multi_device_images = None
+            self.image = image
+            
+        self._image_data = self.image.firmware.serialize()
         self.progress_callback = progress_callback
         self.force = force
 
@@ -54,6 +63,9 @@ class OTAManager:
         )
 
         self.stack = contextlib.ExitStack()
+        
+        # Track which device types have been updated
+        self._updated_device_types = set()
 
     def __enter__(self) -> Self:
         self.stack.enter_context(
@@ -117,10 +129,34 @@ class OTAManager:
     ) -> None:
         """Handle image query request."""
 
+        # If we have multiple device images, select the appropriate one
+        if self.multi_device_images is not None:
+            device_type = command.image_type
+            if device_type in self.multi_device_images:
+                current_image = self.multi_device_images[device_type]
+                self._image_data = current_image.firmware.serialize()
+            else:
+                # No image available for this device type
+                status = foundation.Status.NO_IMAGE_AVAILABLE
+                try:
+                    await self.ota_cluster.query_next_image_response(
+                        status=status,
+                        tsn=hdr.tsn,
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    self.device.debug("OTA query_next_image handler exception", exc_info=ex)
+                    status = foundation.Status.FAILURE
+                
+                if status != foundation.Status.SUCCESS:
+                    self._finish(status)
+                return
+        else:
+            current_image = self.image
+
         # If we try to send a device an old image (e.g. cache issue), don't bother
         if not self.force and (
-            not self.image.check_compatibility(self.device, command)
-            or not self.image.check_version(command.current_file_version)
+            not current_image.check_compatibility(self.device, command)
+            or not current_image.check_version(command.current_file_version)
         ):
             status = foundation.Status.NO_IMAGE_AVAILABLE
         else:
@@ -129,10 +165,10 @@ class OTAManager:
         try:
             await self.ota_cluster.query_next_image_response(
                 status=status,
-                manufacturer_code=self.image.firmware.header.manufacturer_id,
-                image_type=self.image.firmware.header.image_type,
-                file_version=self.image.firmware.header.file_version,
-                image_size=self.image.firmware.header.image_size,
+                manufacturer_code=current_image.firmware.header.manufacturer_id,
+                image_type=current_image.firmware.header.image_type,
+                file_version=current_image.firmware.header.file_version,
+                image_size=current_image.firmware.header.image_size,
                 tsn=hdr.tsn,
             )
         except Exception as ex:  # noqa: BLE001
@@ -159,6 +195,20 @@ class OTAManager:
         self, hdr: foundation.ZCLHeader, command: Ota.ImageBlockCommand
     ) -> None:
         """Handle image block request."""
+        # Get the current image (either from multi-device images or the single image)
+        if self.multi_device_images is not None:
+            device_type = command.image_type
+            if device_type in self.multi_device_images:
+                current_image = self.multi_device_images[device_type]
+            else:
+                # This shouldn't happen if _image_query_req worked correctly
+                await self._finish_malformed_image_block_response(
+                    "image_block", tsn=hdr.tsn
+                )
+                return
+        else:
+            current_image = self.image
+            
         if command.manufacturer_code == 4129:
             # Legrand devices (manufacturer_code == 4129) require up to 64 bytes.
             default_image_block_size = 255
@@ -178,9 +228,9 @@ class OTAManager:
         try:
             await self.ota_cluster.image_block_response(
                 status=foundation.Status.SUCCESS,
-                manufacturer_code=self.image.firmware.header.manufacturer_id,
-                image_type=self.image.firmware.header.image_type,
-                file_version=self.image.firmware.header.file_version,
+                manufacturer_code=current_image.firmware.header.manufacturer_id,
+                image_type=current_image.firmware.header.image_type,
+                file_version=current_image.firmware.header.file_version,
                 file_offset=command.file_offset,
                 image_data=block,
                 tsn=hdr.tsn,
@@ -204,6 +254,20 @@ class OTAManager:
         self, hdr: foundation.ZCLHeader, command: Ota.ImagePageCommand
     ) -> None:
         """Handle image page request."""
+        # Get the current image (either from multi-device images or the single image)
+        if self.multi_device_images is not None:
+            device_type = command.image_type
+            if device_type in self.multi_device_images:
+                current_image = self.multi_device_images[device_type]
+            else:
+                # This shouldn't happen if _image_query_req worked correctly
+                await self._finish_malformed_image_block_response(
+                    "image_page_req", tsn=hdr.tsn
+                )
+                return
+        else:
+            current_image = self.image
+            
         offset = command.file_offset
         bytes_remaining = min(
             command.page_size, len(self._image_data) - command.file_offset
@@ -236,9 +300,9 @@ class OTAManager:
                     expect_reply=False,
                     # kwargs
                     status=foundation.Status.SUCCESS,
-                    manufacturer_code=self.image.firmware.header.manufacturer_id,
-                    image_type=self.image.firmware.header.image_type,
-                    file_version=self.image.firmware.header.file_version,
+                    manufacturer_code=current_image.firmware.header.manufacturer_id,
+                    image_type=current_image.firmware.header.image_type,
+                    file_version=current_image.firmware.header.file_version,
                     file_offset=offset - block_size,
                     image_data=block,
                 )
@@ -263,15 +327,35 @@ class OTAManager:
         self, hdr: foundation.ZCLHeader, command: foundation.CommandSchema
     ) -> None:
         """Handle upgrade end request."""
+        # Get the current image (either from multi-device images or the single image)
+        if self.multi_device_images is not None:
+            device_type = command.image_type
+            if device_type in self.multi_device_images:
+                current_image = self.multi_device_images[device_type]
+                # Track that this device type has been updated
+                self._updated_device_types.add(device_type)
+            else:
+                # This shouldn't happen if _image_query_req worked correctly
+                self._finish(foundation.Status.FAILURE)
+                return
+        else:
+            current_image = self.image
+            
         try:
             await self.ota_cluster.upgrade_end_response(
-                manufacturer_code=self.image.firmware.header.manufacturer_id,
-                image_type=self.image.firmware.header.image_type,
-                file_version=self.image.firmware.header.file_version,
+                manufacturer_code=current_image.firmware.header.manufacturer_id,
+                image_type=current_image.firmware.header.image_type,
+                file_version=current_image.firmware.header.file_version,
                 current_time=0x00000000,
                 upgrade_time=0x00000000,
                 tsn=hdr.tsn,
             )
+
+            # If we have multiple device types and not all have been updated, don't finish yet
+            if (self.multi_device_images is not None and 
+                len(self._updated_device_types) < len(self.multi_device_images)):
+                # Continue waiting for other device types to update
+                return
 
             self._finish(command.status)
         except Exception as ex:  # noqa: BLE001
@@ -326,5 +410,51 @@ async def update_firmware(
             progress_callback(current, total, progress)
 
     with OTAManager(device, image, progress_callback=progress, force=force) as ota:
+        await ota.notify()
+        return await ota.wait()
+
+
+async def update_firmware_multi_device(
+    device: Device,
+    multi_device_images: dict[int, OtaImageWithMetadata],
+    progress_callback: callable | None = None,
+    force: bool = False,
+) -> foundation.Status:
+    """Update the firmware on a Zigbee device that has multiple device types.
+    
+    Args:
+        device: The device to update
+        multi_device_images: Dictionary mapping device types to their firmware images
+        progress_callback: Optional callback for progress updates
+        force: Whether to force the update even if versions match
+        
+    Returns:
+        Status of the update operation
+    """
+    if force:
+        # Force it to send the images even if they're the same version
+        forced_images = {}
+        for device_type, image in multi_device_images.items():
+            forced_images[device_type] = image.replace(
+                metadata=image.metadata.replace(file_version=0xFFFFFFFF - 1),
+                firmware=image.firmware.replace(
+                    header=image.firmware.header.replace(file_version=0xFFFFFFFF - 1)
+                ),
+            )
+        multi_device_images = forced_images
+
+    def progress(current: int, total: int):
+        progress = (100 * current) / total
+        device.info(
+            "OTA upgrade progress: (%d / %d): %0.4f%%",
+            current,
+            total,
+            progress,
+        )
+        if progress_callback is not None:
+            progress_callback(current, total, progress)
+
+    with OTAManager(device, None, progress_callback=progress, force=force, 
+                   multi_device_images=multi_device_images) as ota:
         await ota.notify()
         return await ota.wait()

@@ -11,7 +11,7 @@ import time
 import typing
 import warnings
 
-from zigpy.ota.manager import find_ota_cluster, update_firmware
+from zigpy.ota.manager import find_ota_cluster, update_firmware, update_firmware_multi_device
 from zigpy.zcl.clusters.general import Ota
 
 if sys.version_info[:2] < (3, 11):
@@ -586,6 +586,55 @@ class Device(zigpy.util.LocalLogMixin, zigpy.util.ListenableMixin):
             result = await update_firmware(
                 device=self,
                 image=image,
+                progress_callback=progress_callback,
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.debug("OTA failed!", exc_info=exc)
+            raise
+        finally:
+            self.ota_in_progress = False
+
+        if result != foundation.Status.SUCCESS:
+            return result
+
+        # Clear the current file version when the update succeeds
+        ota = find_ota_cluster(self)
+        ota.update_attribute(Ota.AttributeDefs.current_file_version.id, None)
+
+        await asyncio.sleep(AFTER_OTA_ATTR_READ_DELAY)
+        await OTA_RETRY_DECORATOR(ota.read_attributes)(
+            [Ota.AttributeDefs.current_file_version.name]
+        )
+
+        return result
+
+    async def update_firmware_multi_device(
+        self,
+        multi_device_images: dict[int, OtaImageWithMetadata],
+        progress_callback: callable | None = None,
+        force: bool = False,
+    ) -> foundation.Status:
+        """Update device firmware for a device with multiple device types.
+        
+        Args:
+            multi_device_images: Dictionary mapping device types to their firmware images
+            progress_callback: Optional callback for progress updates
+            force: Whether to force the update even if versions match
+            
+        Returns:
+            Status of the update operation
+        """
+        if self.ota_in_progress:
+            self.debug("OTA already in progress")
+            return None
+
+        self.ota_in_progress = True
+
+        try:
+            result = await update_firmware_multi_device(
+                device=self,
+                multi_device_images=multi_device_images,
                 progress_callback=progress_callback,
                 force=force,
             )
